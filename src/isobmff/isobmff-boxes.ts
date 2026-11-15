@@ -64,6 +64,13 @@ import { MetadataTags, RichImageData } from '../metadata';
 import { Bitstream } from '../../shared/bitstream';
 import { VERSIONED_NAME } from '../version';
 
+/**
+ * Returns the presentation span of a track, preferring the cached statistics computed during finalization
+ * over recomputing it from all samples.
+ */
+const trackPresentationSpan = (trackData: IsobmffTrackData) =>
+	trackData.finalizedStats?.presentationSpan ?? presentationSpan(trackData);
+
 export class IsobmffBoxWriter {
 	private helper = new Uint8Array(8);
 	private helperView = new DataView(this.helper.buffer);
@@ -281,6 +288,27 @@ export const fullBox = (
 );
 
 /**
+ * Creates a Full box whose contents are written directly into a freshly allocated byte array using the given
+ * callback. This is much more efficient than building up nested number arrays for large tables.
+ */
+const directFullBox = (
+	type: string,
+	version: number,
+	flags: number,
+	bodyByteLength: number,
+	writeBody: (view: DataView, offset: number) => void,
+): Box => {
+	assert(flags >= 0 && flags <= 0xffffff);
+
+	const contents = new Uint8Array(4 + bodyByteLength);
+	const view = new DataView(contents.buffer);
+	view.setUint32(0, (version << 24) | flags, false);
+	writeBody(view, 4);
+
+	return { type, contents };
+};
+
+/**
  * File Type Compatibility Box: Allows the reader to determine whether this is a type of file that the
  * reader understands.
  */
@@ -403,7 +431,7 @@ export const mvhd = (
 				// Round separately to match the edit list
 				Math.max(
 					0,
-					intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
+					intoTimescale(trackPresentationSpan(trackData), GLOBAL_TIMESCALE)
 					+ intoTimescale(trackData.startTimestampOffset ?? 0, GLOBAL_TIMESCALE),
 				)
 			)),
@@ -459,7 +487,7 @@ export const tkhd = (
 	// Round separately to match the edit list
 	const durationInGlobalTimescale = Math.max(
 		0,
-		intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
+		intoTimescale(trackPresentationSpan(trackData), GLOBAL_TIMESCALE)
 		+ intoTimescale(trackData.startTimestampOffset ?? 0, GLOBAL_TIMESCALE),
 	);
 
@@ -525,7 +553,7 @@ export const edts = (trackData: IsobmffTrackData) => {
 		// Positive offset: empty segment at the start, then the full media afterwards
 
 		const startOffset = intoTimescale(offset, GLOBAL_TIMESCALE);
-		const mediaDuration = intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE);
+		const mediaDuration = intoTimescale(trackPresentationSpan(trackData), GLOBAL_TIMESCALE);
 
 		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration);
 		const u32OrU64 = needs64Bits ? u64 : u32;
@@ -555,7 +583,7 @@ export const edts = (trackData: IsobmffTrackData) => {
 		// "the segment_duration of this edit may be zero"
 		const mediaDuration = Math.max(
 			0,
-			intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
+			intoTimescale(trackPresentationSpan(trackData), GLOBAL_TIMESCALE)
 			+ intoTimescale(offset, GLOBAL_TIMESCALE),
 		);
 
@@ -590,7 +618,7 @@ export const mdhd = (
 ) => {
 	// Since _this_ duration represents the raw media duration, edit list offsets are not taken into account here
 	const localDuration = intoTimescale(
-		presentationSpan(trackData),
+		trackPresentationSpan(trackData),
 		trackData.timescale,
 	);
 
@@ -703,7 +731,8 @@ export const stbl = (trackData: IsobmffTrackData) => {
 		stsz(trackData),
 		stco(trackData),
 		stss(trackData),
-		...sgpdAndSbgp(trackData.samples, false),
+		// Only audio samples can have preroll samples, so we can skip the scan for other track types
+		...(trackData.type === 'audio' ? sgpdAndSbgp(trackData.samples, false) : []),
 	]);
 };
 
@@ -1258,24 +1287,49 @@ export const txtC = (textConfig: Uint8Array) => fullBox('txtC', 0, 0, [
  * will be grouped.
  */
 export const stts = (trackData: IsobmffTrackData) => {
-	return fullBox('stts', 0, 0, [
-		u32(trackData.timeToSampleTable.length), // Number of entries
-		trackData.timeToSampleTable.map(x => [ // Time-to-sample table
-			u32(x.sampleCount), // Sample count
-			u32(x.sampleDelta), // Sample duration
-		]),
-	]);
+	const table = trackData.timeToSampleTable;
+
+	return directFullBox('stts', 0, 0, 4 + 8 * table.length, (view, offset) => {
+		view.setUint32(offset, table.length, false); // Number of entries
+		offset += 4;
+
+		for (const entry of table) {
+			view.setUint32(offset, entry.sampleCount, false); // Sample count
+			view.setUint32(offset + 4, entry.sampleDelta, false); // Sample duration
+			offset += 8;
+		}
+	});
 };
 
 /** Sync Sample Box: Identifies the key frames in the media, marking the random access points within a stream. */
 export const stss = (trackData: IsobmffTrackData) => {
-	if (trackData.samples.every(x => x.type === 'key')) return null; // No stss box -> every frame is a key frame
+	let keySampleIndices = trackData.finalizedStats?.keySampleIndices;
 
-	const keySamples = [...trackData.samples.entries()].filter(([, sample]) => sample.type === 'key');
-	return fullBox('stss', 0, 0, [
-		u32(keySamples.length), // Number of entries
-		keySamples.map(([index]) => u32(index + 1)), // Sync sample table
-	]);
+	if (keySampleIndices === undefined) {
+		// No cached statistics available; compute the indices from the samples
+		const samples = trackData.samples;
+		const indices: number[] = [];
+
+		for (let i = 0; i < samples.length; i++) {
+			if (samples[i]!.type === 'key') {
+				indices.push(i + 1);
+			}
+		}
+
+		keySampleIndices = indices.length === samples.length ? null : indices;
+	}
+
+	if (keySampleIndices === null) return null; // No stss box -> every frame is a key frame
+
+	return directFullBox('stss', 0, 0, 4 + 4 * keySampleIndices.length, (view, offset) => {
+		view.setUint32(offset, keySampleIndices.length, false); // Number of entries
+		offset += 4;
+
+		for (let i = 0; i < keySampleIndices.length; i++) {
+			view.setUint32(offset, keySampleIndices[i]!, false); // Sync sample table
+			offset += 4;
+		}
+	});
 };
 
 /**
@@ -1285,14 +1339,19 @@ export const stss = (trackData: IsobmffTrackData) => {
  * in a compactly-coded fashion.
  */
 export const stsc = (trackData: IsobmffTrackData) => {
-	return fullBox('stsc', 0, 0, [
-		u32(trackData.compactlyCodedChunkTable.length), // Number of entries
-		trackData.compactlyCodedChunkTable.map(x => [ // Sample-to-chunk table
-			u32(x.firstChunk), // First chunk
-			u32(x.samplesPerChunk), // Samples per chunk
-			u32(1), // Sample description index
-		]),
-	]);
+	const table = trackData.compactlyCodedChunkTable;
+
+	return directFullBox('stsc', 0, 0, 4 + 12 * table.length, (view, offset) => {
+		view.setUint32(offset, table.length, false); // Number of entries
+		offset += 4;
+
+		for (const entry of table) {
+			view.setUint32(offset, entry.firstChunk, false); // First chunk
+			view.setUint32(offset + 4, entry.samplesPerChunk, false); // Samples per chunk
+			view.setUint32(offset + 8, 1, false); // Sample description index
+			offset += 12;
+		}
+	});
 };
 
 /** Sample Size Box: Specifies the byte size of each sample in the media. */
@@ -1307,27 +1366,77 @@ export const stsz = (trackData: IsobmffTrackData) => {
 		]);
 	}
 
-	return fullBox('stsz', 0, 0, [
-		u32(0), // Sample size (0 means non-constant size)
-		u32(trackData.samples.length), // Number of entries
-		trackData.samples.map(x => u32(x.size)), // Sample size table
-	]);
+	const cachedSampleSizes = trackData.finalizedStats?.sampleSizes;
+	const sampleCount = cachedSampleSizes?.length ?? trackData.samples.length;
+
+	return directFullBox('stsz', 0, 0, 8 + 4 * sampleCount, (view, offset) => {
+		view.setUint32(offset, 0, false); // Sample size (0 means non-constant size)
+		view.setUint32(offset + 4, sampleCount, false); // Number of entries
+		offset += 8;
+
+		if (cachedSampleSizes) {
+			for (let i = 0; i < cachedSampleSizes.length; i++) {
+				view.setUint32(offset, cachedSampleSizes[i]!, false); // Sample size table
+				offset += 4;
+			}
+		} else {
+			const samples = trackData.samples;
+			for (let i = 0; i < samples.length; i++) {
+				view.setUint32(offset, samples[i]!.size, false); // Sample size table
+				offset += 4;
+			}
+		}
+	});
 };
 
 /** Chunk Offset Box: Identifies the location of each chunk of data in the media's data stream, relative to the file. */
 export const stco = (trackData: IsobmffTrackData) => {
-	if (trackData.finalizedChunks.length > 0 && last(trackData.finalizedChunks)!.offset! >= 2 ** 32) {
+	const chunks = trackData.finalizedChunks;
+
+	if (chunks.length > 0 && last(chunks)!.offset! >= 2 ** 32) {
 		// If the file is large, use the co64 box
-		return fullBox('co64', 0, 0, [
-			u32(trackData.finalizedChunks.length), // Number of entries
-			trackData.finalizedChunks.map(x => u64(x.offset!)), // Chunk offset table
-		]);
+		return directFullBox('co64', 0, 0, 4 + 8 * chunks.length, (view, offset) => {
+			view.setUint32(offset, chunks.length, false); // Number of entries
+			offset += 4;
+
+			for (const chunk of chunks) {
+				const chunkOffset = chunk.offset!;
+				view.setUint32(offset, Math.floor(chunkOffset / 2 ** 32), false); // Chunk offset (high)
+				view.setUint32(offset + 4, chunkOffset, false); // Chunk offset (low)
+				offset += 8;
+			}
+		});
 	}
 
-	return fullBox('stco', 0, 0, [
-		u32(trackData.finalizedChunks.length), // Number of entries
-		trackData.finalizedChunks.map(x => u32(x.offset!)), // Chunk offset table
-	]);
+	return directFullBox('stco', 0, 0, 4 + 4 * chunks.length, (view, offset) => {
+		view.setUint32(offset, chunks.length, false); // Number of entries
+		offset += 4;
+
+		for (const chunk of chunks) {
+			view.setUint32(offset, chunk.offset!, false); // Chunk offset table
+			offset += 4;
+		}
+	});
+};
+
+/**
+ * Finds all chunk offset boxes (stco/co64) in a box tree, in tree order. Used to update the chunk offsets in an
+ * already-built moov box once the final chunk positions are known.
+ */
+export const findChunkOffsetBoxes = (box: Box, results: Box[] = []): Box[] => {
+	if (box.children) {
+		for (const child of box.children) {
+			if (!child) continue;
+
+			if (child.type === 'stco' || child.type === 'co64') {
+				results.push(child);
+			}
+
+			findChunkOffsetBoxes(child, results);
+		}
+	}
+
+	return results;
 };
 
 /**
@@ -1336,13 +1445,18 @@ export const stco = (trackData: IsobmffTrackData) => {
  * composition time offset will be grouped.
  */
 export const ctts = (trackData: IsobmffTrackData) => {
-	return fullBox('ctts', 1, 0, [
-		u32(trackData.compositionTimeOffsetTable.length), // Number of entries
-		trackData.compositionTimeOffsetTable.map(x => [ // Time-to-sample table
-			u32(x.sampleCount), // Sample count
-			i32(x.sampleCompositionTimeOffset), // Sample offset
-		]),
-	]);
+	const table = trackData.compositionTimeOffsetTable;
+
+	return directFullBox('ctts', 1, 0, 4 + 8 * table.length, (view, offset) => {
+		view.setUint32(offset, table.length, false); // Number of entries
+		offset += 4;
+
+		for (const entry of table) {
+			view.setUint32(offset, entry.sampleCount, false); // Sample count
+			view.setInt32(offset + 4, entry.sampleCompositionTimeOffset, false); // Sample offset
+			offset += 8;
+		}
+	});
 };
 
 /**
@@ -1510,7 +1624,8 @@ export const traf = (trackData: IsobmffTrackData) => {
 		tfhd(trackData),
 		tfdt(trackData),
 		trun(trackData),
-		...sgpdAndSbgp(trackData.currentChunk!.samples, true),
+		// Only audio samples can have preroll samples, so we can skip the scan for other track types
+		...(trackData.type === 'audio' ? sgpdAndSbgp(trackData.currentChunk!.samples, true) : []),
 	]);
 };
 

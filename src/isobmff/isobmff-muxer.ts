@@ -8,6 +8,7 @@
 
 import {
 	Box,
+	findChunkOffsetBoxes,
 	free,
 	ftyp,
 	IsobmffBoxWriter,
@@ -16,6 +17,7 @@ import {
 	moof,
 	moov,
 	sidx,
+	stco,
 	styp,
 	vtta,
 	vttc,
@@ -101,6 +103,17 @@ export type IsobmffTrackData = {
 		samplesPerChunk: number;
 	}[];
 	closed: boolean;
+
+	/**
+	 * Statistics about the track's samples, computed in a single pass when finalizing a non-fragmented file.
+	 * Box generators can use these to avoid having to loop over all samples again.
+	 */
+	finalizedStats: {
+		presentationSpan: number;
+		/** The 1-based indices of all key samples, or null if every sample is a key sample. */
+		keySampleIndices: number[] | null;
+		sampleSizes: Uint32Array;
+	} | null;
 
 	// 0 means unknown
 	avgBitrate: number;
@@ -530,6 +543,7 @@ export class IsobmffMuxer extends Muxer {
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
 			closed: false,
+			finalizedStats: null,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 		};
@@ -638,6 +652,7 @@ export class IsobmffMuxer extends Muxer {
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
 			closed: false,
+			finalizedStats: null,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 		};
@@ -683,6 +698,7 @@ export class IsobmffMuxer extends Muxer {
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
 			closed: false,
+			finalizedStats: null,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 
@@ -1654,37 +1670,62 @@ export class IsobmffMuxer extends Muxer {
 			}
 
 			for (const trackData of this.trackDatas) {
-				// Now that we have all samples, we can replace the nominal bitrates with measured ones
-				const span = presentationSpan(trackData);
-				if (span > 0) {
-					let totalBytes = 0;
-					for (const sample of trackData.samples) {
-						totalBytes += sample.size;
-					}
+				// Compute all statistics about the track's samples in a single pass. These are used for computing
+				// bitrates, and later by the box generators to avoid having to loop over all samples again.
+				const samples = trackData.samples;
+				const sampleCount = samples.length;
+				const sampleSizes = new Uint32Array(sampleCount);
+				const keySampleIndices: number[] = [];
 
-					trackData.avgBitrate = Math.round(8 * totalBytes / span);
-				} else {
-					trackData.avgBitrate = 0;
-				}
+				let minTimestamp = Infinity;
+				let maxEndTimestamp = -Infinity;
+				let totalBytes = 0;
 
 				// Sliding one-second window over the samples in decode order
 				let windowStart = 0;
 				let windowBytes = 0;
 				let maxWindowBytes = 0;
-				for (let i = 0; i < trackData.samples.length; i++) {
-					const sample = trackData.samples[i]!;
-					windowBytes += sample.size;
 
-					while (sample.decodeTimestamp - trackData.samples[windowStart]!.decodeTimestamp >= 1) {
-						windowBytes -= trackData.samples[windowStart]!.size;
-						windowStart++;
+				for (let i = 0; i < sampleCount; i++) {
+					const sample = samples[i]!;
+
+					if (sample.timestamp < minTimestamp) {
+						minTimestamp = sample.timestamp;
+					}
+					if (sample.timestamp + sample.duration > maxEndTimestamp) {
+						maxEndTimestamp = sample.timestamp + sample.duration;
 					}
 
-					maxWindowBytes = Math.max(maxWindowBytes, windowBytes);
+					totalBytes += sample.size;
+					sampleSizes[i] = sample.size;
+
+					if (sample.type === 'key') {
+						keySampleIndices.push(i + 1);
+					}
+
+					windowBytes += sample.size;
+					while (sample.decodeTimestamp - samples[windowStart]!.decodeTimestamp >= 1) {
+						windowBytes -= samples[windowStart]!.size;
+						windowStart++;
+					}
+					if (windowBytes > maxWindowBytes) {
+						maxWindowBytes = windowBytes;
+					}
 				}
+
+				const span = minTimestamp === Infinity ? 0 : maxEndTimestamp - minTimestamp;
+
+				// Now that we have all samples, we can replace the nominal bitrates with measured ones
+				trackData.avgBitrate = span > 0 ? Math.round(8 * totalBytes / span) : 0;
 				trackData.maxBitrate = 8 * maxWindowBytes;
 
-				if (trackData.startTimestampOffset !== null) {
+				trackData.finalizedStats = {
+					presentationSpan: span,
+					keySampleIndices: keySampleIndices.length === sampleCount ? null : keySampleIndices,
+					sampleSizes,
+				};
+
+				if (trackData.startTimestampOffset !== null && trackData.startTimestampOffset !== 0) {
 					// Shift all of the samples by the start offset. We'll then write out an edit list that will shift
 					// them back to their proper spot in the composition.
 					for (let i = 0; i < trackData.samples.length; i++) {
@@ -1711,30 +1752,40 @@ export class IsobmffMuxer extends Muxer {
 			// being used in the moov box instead, which will make it larger. After that, we definitely know the final
 			// size of the moov box and can compute the proper chunk positions.
 
+			let movieBox = moov(this);
 			for (let i = 0; i < 2; i++) {
-				const movieBox = moov(this);
 				const movieBoxSize = this.boxWriter.measureBox(movieBox);
 				mdatSize = this.boxWriter.measureBox(this.mdat);
 				let currentChunkPos = this.writer.getPos() + movieBoxSize + mdatSize;
 
 				for (const chunk of this.finalizedChunks) {
 					chunk.offset = currentChunkPos;
-					for (const { data } of chunk.samples) {
-						assert(data);
-						currentChunkPos += data.byteLength;
-						mdatSize += data.byteLength;
+					for (const sample of chunk.samples) {
+						currentChunkPos += sample.size;
+						mdatSize += sample.size;
 					}
 				}
 
 				if (currentChunkPos < 2 ** 32) break;
 				if (mdatSize >= 2 ** 32) this.mdat.largeSize = true;
+
+				// The chunk offsets don't fit into 32 bits, so we need to rebuild the moov box: the co64 box will
+				// now be used instead of stco, changing the size of the moov box and therefore the chunk positions
+				movieBox = moov(this);
+			}
+
+			// Now that the final chunk positions are known, update the chunk offset boxes with them; they were
+			// built with placeholder values. This avoids having to build the entire moov box again.
+			const chunkOffsetBoxes = findChunkOffsetBoxes(movieBox);
+			assert(chunkOffsetBoxes.length === this.trackDatas.length);
+			for (let i = 0; i < this.trackDatas.length; i++) {
+				chunkOffsetBoxes[i]!.contents = stco(this.trackDatas[i]!).contents;
 			}
 
 			if (this.formatOptions.onMoov) {
 				this.writer.startTrackingWrites();
 			}
 
-			const movieBox = moov(this);
 			this.boxWriter.writeBox(movieBox);
 
 			if (this.formatOptions.onMoov) {
@@ -1749,13 +1800,44 @@ export class IsobmffMuxer extends Muxer {
 			this.mdat.size = mdatSize!;
 			this.boxWriter.writeBox(this.mdat);
 
+			// Write out all sample data. To avoid a large number of small writes, the data is first accumulated
+			// and then written out in larger blocks.
+			const writer = this.writer;
+			const pendingData: Uint8Array[] = [];
+			let pendingDataLength = 0;
+
+			const flushPendingData = () => {
+				if (pendingDataLength === 0) {
+					return;
+				}
+
+				const mergedData = new Uint8Array(pendingDataLength);
+				let offset = 0;
+				for (const data of pendingData) {
+					mergedData.set(data, offset);
+					offset += data.byteLength;
+				}
+
+				pendingData.length = 0;
+				pendingDataLength = 0;
+
+				writer.write(mergedData);
+			};
+
 			for (const chunk of this.finalizedChunks) {
 				for (const sample of chunk.samples) {
 					assert(sample.data);
-					this.writer.write(sample.data);
-					sample.data = null;
+					pendingData.push(sample.data);
+					pendingDataLength += sample.data.byteLength;
+					sample.data = null; // Can be GC'd
+				}
+
+				if (pendingDataLength >= 2 ** 24) {
+					flushPendingData();
 				}
 			}
+
+			flushPendingData();
 
 			if (this.formatOptions.onMdat) {
 				const { data, start } = this.writer.stopTrackingWrites();
